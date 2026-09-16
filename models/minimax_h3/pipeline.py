@@ -220,13 +220,14 @@ def _build_outpainting_mask(video, outpainting_dims):
     return mask
 
 
-def _encode_video_source(vae, video, device, outpainting_dims=None):
-    location = _outpainting_frame_location(video, outpainting_dims)
-    if location is None:
-        return vae.encode(video.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
-    inner_height, inner_width, top, left = location
-    source = video[..., top:top + inner_height, left:left + inner_width]
-    source_latents = vae.encode(source.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
+def _encode_video_source(vae, video, device, outpainting_dims=None, *, tile_size):
+    with vae.tiling(tile_size):
+        location = _outpainting_frame_location(video, outpainting_dims)
+        if location is None:
+            return vae.encode(video.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
+        inner_height, inner_width, top, left = location
+        source = video[..., top:top + inner_height, left:left + inner_width]
+        source_latents = vae.encode(source.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
     ratio = vae.spatial_compression_ratio
     latents = source_latents.new_zeros((*source_latents.shape[:-2], math.ceil(video.shape[-2] / ratio), math.ceil(video.shape[-1] / ratio)))
     latent_top, latent_left = top // ratio, left // ratio
@@ -360,6 +361,7 @@ class MiniMaxH3Pipeline:
         self.text_encoder = text_encoder
         self.fixed_prompt = fixed_prompt
         self.vae = video_vae
+        self._decode_tile_size, self._encode_tile_size = video_vae.resolve_VAE_tile_sizes(None)
         self.video_encoder = torch.nn.ModuleDict({"encoder": video_vae.encoder, "quant_conv": video_vae.quant_conv})
         self.video_decoder = torch.nn.ModuleDict({"post_quant_conv": video_vae.post_quant_conv, "decoder": video_vae.decoder})
         # These are profiled as separate MMGP models. Preserve the dtype selected
@@ -484,12 +486,17 @@ class MiniMaxH3Pipeline:
         cache_key = self._prompt_cache_key(prompt, presentation)
         return self.text_encoder_cache.encode(encode_fn, prompt, device=self.device, cache_keys=cache_key)[0]
 
-    def _configure_tiling(self, _tile_size):
-        self.vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
+    def _configure_tiling(self, VAE_tile_size):
+        # Decoding and single-frame encodes run with the decode tile size; encoding a control,
+        # reference or source video temporarily switches to the (usually smaller) encode tile size.
+        self._decode_tile_size, self._encode_tile_size = self.vae.resolve_VAE_tile_sizes(VAE_tile_size)
+        self.vae.set_tiling(self._decode_tile_size)
 
     def _encode_video(self, video, keep_all_latents=False):
         self._check_abort()
-        return self.vae.encode_condition(video.unsqueeze(0).to(device=self.device, dtype=self.vae._model_dtype), keep_all_latents=keep_all_latents).cpu()
+        tile_size = self._encode_tile_size if video.shape[1] > 1 else self._decode_tile_size
+        with self.vae.tiling(tile_size):
+            return self.vae.encode_condition(video.unsqueeze(0).to(device=self.device, dtype=self.vae._model_dtype), keep_all_latents=keep_all_latents).cpu()
 
     def _waveform(self, waveform, sample_rate):
         if waveform is None:
@@ -883,7 +890,7 @@ class MiniMaxH3Pipeline:
             self._check_abort()
             source_video = _resize_video(_as_video(input_frames)[:, history_count:history_count + aligned_target_frames], height, width)
             with control_video_encoding(control_video):
-                source_latents = _encode_video_source(self.vae, source_video, self.device, outpainting_dims).cpu()
+                source_latents = _encode_video_source(self.vae, source_video, self.device, outpainting_dims, tile_size=self._encode_tile_size).cpu()
             self._check_abort()
             if input_masks is not None:
                 source_mask = input_masks[:, history_count:history_count + source_video.shape[1]]
@@ -1248,7 +1255,7 @@ class MiniMaxH3Pipeline:
                 if video_to_video:
                     phase_2_source_video = _resize_video(_as_video(input_frames)[:, history_count:history_count + aligned_target_frames], target_height, target_width)
                     with control_video_encoding(control_video):
-                        phase_2_source_latents = _encode_video_source(self.vae, phase_2_source_video, self.device, outpainting_dims)
+                        phase_2_source_latents = _encode_video_source(self.vae, phase_2_source_video, self.device, outpainting_dims, tile_size=self._encode_tile_size)
                     phase_2_source_latents = phase_2_source_latents[:, :, :latent_t].to(device="cpu", dtype=phase_2_latent_canvas.dtype, non_blocking=False)
                     if input_masks is not None:
                         phase_2_source_mask = input_masks[:, history_count:history_count + phase_2_source_video.shape[1]]
@@ -1389,7 +1396,7 @@ class MiniMaxH3Pipeline:
                     self._use_shared_components()
                     source_video = _resize_video(_as_video(input_frames)[:, history_count:history_count + aligned_target_frames], target_height, target_width)
                     with control_video_encoding(control_video):
-                        source_latents = _encode_video_source(self.vae, source_video, self.device, outpainting_dims).cpu()[:, :, :latent_t].to(video)
+                        source_latents = _encode_video_source(self.vae, source_video, self.device, outpainting_dims, tile_size=self._encode_tile_size).cpu()[:, :, :latent_t].to(video)
                     source_noise = phase_2_noise[:, :, :source_latents.shape[2]]
                     source_buffer = torch.empty_like(source_latents)
                     if input_masks is not None:
