@@ -135,8 +135,8 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
             raise ValueError(f"Unknown LTX video upsampling mode: {spatial_upsampling}")
         from .runtime import RUNTIME, upscale_video
 
-        if vae_tile_size is None:
-            vae_tile_size = RUNTIME.vae_tile_size(vae_config, supported_spatial_size(sample.shape[-2]) * 2, supported_spatial_size(sample.shape[-1]) * 2)
+        # The incoming vae_tile_size was computed for the main model's VAE, which may not be the LTX2 VAE.
+        vae_tile_size = RUNTIME.vae_tile_size(vae_config, supported_spatial_size(sample.shape[-2]) * 2, supported_spatial_size(sample.shape[-1]) * 2)
         config = self.config()
         return upscale_video(sample, prompt=prompt, negative_prompt=negative_prompt, audio_waveform=audio_waveform, audio_sample_rate=audio_sample_rate, source_audio_path=source_audio_path, seed=seed, fps=fps, window_size=config["window_size"], window_overlap=config["window_overlap"], frame_offset=frame_offset, vae_tile_size=vae_tile_size, abort_callback=abort_callback, progress_callback=progress_callback)
 
