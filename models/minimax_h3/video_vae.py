@@ -14,6 +14,8 @@
 #
 # WanGP boundary adapter around the official MiniMax-H3 video VAE.
 
+import contextlib
+
 import torch
 
 from shared.utils.phase_progress import vae_encoding_progress
@@ -50,11 +52,47 @@ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
         self.register_buffer("pixel_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
         self._interrupt = False
 
-    @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        if vae_config == 0:
-            return 256
-        return {1: 0, 2: 512, 3: 256}.get(int(vae_config), 128)
+    DECODE_TILE_SIZE = 256
+    ENCODE_TILE_SIZE = 256
+    LOW_VRAM_ENCODE_TILE_SIZE = 128
+
+    @classmethod
+    def get_VAE_tile_size(cls, vae_config, device_mem_capacity, mixed_precision):
+        """Return the spatial tile sizes (pixels) as ``{"decode": int, "encode": int}``.
+
+        Decoding always uses the official 256px tiles; smaller decode tiles produce visible
+        artifacts. Encoding a control/reference video peaks far higher than decoding, so the
+        "Auto" preset encodes with 128px tiles on GPUs with less than 24 GB, and every preset
+        above "16GB+" does so unconditionally.
+        """
+        vae_config = int(vae_config)
+        if mixed_precision:
+            device_mem_capacity = device_mem_capacity / 2
+        if vae_config == 1 or (vae_config == 0 and device_mem_capacity >= 24000):
+            encode = cls.ENCODE_TILE_SIZE
+        else:
+            encode = cls.LOW_VRAM_ENCODE_TILE_SIZE
+        return {"decode": cls.DECODE_TILE_SIZE, "encode": encode}
+
+    @classmethod
+    def resolve_VAE_tile_sizes(cls, VAE_tile_size):
+        """Normalize a ``get_VAE_tile_size`` result or ``None`` to ``(decode, encode)``."""
+        if isinstance(VAE_tile_size, dict):
+            return int(VAE_tile_size.get("decode", cls.DECODE_TILE_SIZE)), int(VAE_tile_size.get("encode", cls.ENCODE_TILE_SIZE))
+        return cls.DECODE_TILE_SIZE, cls.ENCODE_TILE_SIZE
+
+    def set_tiling(self, tile_size):
+        self.enable_tiling(tile_sample_min_height=int(tile_size), tile_sample_min_width=int(tile_size))
+
+    @contextlib.contextmanager
+    def tiling(self, tile_size):
+        """Temporarily switch the spatial tile size, restoring the previous size afterwards."""
+        previous = (self.tile_sample_min_height, self.tile_sample_min_width)
+        self.set_tiling(tile_size)
+        try:
+            yield
+        finally:
+            self.tile_sample_min_height, self.tile_sample_min_width = previous
 
     @property
     def vae_ratio(self):
