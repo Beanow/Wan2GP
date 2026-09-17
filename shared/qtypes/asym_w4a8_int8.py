@@ -238,7 +238,8 @@ def _workspace_rows(k, n):
 
 
 def _kernel_backend(device):
-    if not _TRITON_AVAILABLE or device.type != "cuda" or torch.version.cuda is None:
+    # PyTorch uses cuda devices for both CUDA and ROCm; the backend probes support.
+    if not _TRITON_AVAILABLE or device.type != "cuda":
         return None
     from shared.kernels import quanto_int8_triton
 
