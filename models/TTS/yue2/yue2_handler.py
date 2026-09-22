@@ -90,7 +90,7 @@ INFOS = """**Turn your lyrics into a complete song** with a singing voice and ac
 
 **Optional prompt enhancer:** disabled by default. Choose Lyrics to turn an idea into singable words or tidy existing lyrics; choose Music Style to clarify the sound, or Lyrics then Music Style to prepare both. Review the result before generating. The enhancer does not edit your ABC score.
 
-**Optional ABC score:** upload a UTF-8 `.abc` file if you already have a compatible written melody or composition. Otherwise leave the file input empty for automatic planning. ABC is a text format for musical notation, not a place for instructions such as “make it happier.” Supplying a score replaces the automatic plan. It requires Melody and chords or Melody only; melody-only scores must omit chord symbols. The supported score format uses Vocal and Ins voices. A score and lyrics that belong together give the model clearer guidance.
+**Optional ABC score:** upload a UTF-8 `.abc` file if you already have a compatible written melody or composition. Otherwise leave the file input empty for automatic planning. ABC is a text format for musical notation, not a place for instructions such as “make it happier.” Supplying a score replaces the automatic plan by default. Choose **Continue supplied score (experimental)** under **Source Score Use** to let YuE2 extend an uploaded or transcribed score before generating audio. Supply lyrics for the whole intended song and describe its structure in Music Style. This preserves the source notation as the planner prefix; it does not preserve the source waveform or guarantee a target duration. Maximum Song Duration remains an upper limit. It requires Melody and chords or Melody only; melody-only scores must omit chord symbols. The supported score format uses Vocal and Ins voices. A score and lyrics that belong together give the model clearer guidance.
 
 **Save ABC and MIDI Score:** turn this on to save both `.abc` and `.mid` beside the song, using the same filename. This exports the planned, supplied or source-transcribed composition, not a transcription of the finished performance. The score can be longer than an early-stopped song. Direct generation has no score to export. Off by default.
 
@@ -129,6 +129,7 @@ DEEPY_INFOS = """**YuE2 song generation:** `prompt` = lyrics; `alt_prompt` = mus
 - `activated_loras` / `loras_multipliers`: compatible YuE2 acoustic-model LoRAs, applied during synthesis; start at 1. AR planner LoRAs are not supported.
 - `model_mode`: **0** melody+chords (recommended), **1** melody only/free accompaniment, **2** direct generation.
 - Optional `custom_guide`: path to a UTF-8 `.abc` score file, replacing planning in modes 0/1. Use Vocal/Ins voices and no chords for mode 1. Align the lyrics with the score. Omit for automatic planning; source audio hides and overrides this file. Old `custom_settings.abc` text is ignored.
+- `custom_settings.extend_score`: **0** use the supplied/transcribed score as complete (default), **1** continue it with the ABC planner before audio generation. Requires source audio or ABC and mode 0/1; ordinary YuE2 only. Experimental; duration remains an upper limit.
 - `custom_settings.save_score`: **0** off (default), **1** export both `.abc` and `.mid` with the song's filename. Exports the conditioning composition, not the finished performance; it may outlast a truncated song. Mode 2 exports neither. API artifacts return these side files in memory.
 - **`duration_seconds` is an upper limit, not a requested song length. YuE2 can stop earlier when it considers the song finished.** Increasing it does not force a longer song; too short can cut it off. Very large limits are capped by the remaining model context after lyrics/score. Start with 32 steps and guidance 1; change seed for another take.
 - Abort cancels without audio. Early Stop renders existing audio tokens; during score planning it finishes the score then makes an approximately eight-second preview, capped by duration. Acoustic synthesis/decoding still finish; previews may end mid-phrase.
@@ -207,6 +208,8 @@ class family_handler:
                 "specialities": [{"name": "hum to song", "aliases": ["humming to song"], "description": "Create a song from a hummed melody, lyrics and music style."}],
             })
             definition.pop("custom_guide")
+        else:
+            definition["custom_settings"].append({"id": "extend_score", "name": "Source Score Use", "label": "Source Score Use", "type": "dropdown", "choices": [("Use as complete score", 0), ("Continue supplied score (experimental)", 1)], "default": 0})
         return definition
 
     @staticmethod
@@ -255,6 +258,9 @@ class family_handler:
             if inputs["model_mode"] not in (0, 1):
                 return "Choose Continue Hum or Hum Only."
         scoring = "A" in inputs["audio_prompt_type"]
+        if base_model_type != HUM_ARCHITECTURE and (inputs.get("custom_settings") or {}).get("extend_score", 0) == 1:
+            if inputs["model_mode"] == 2 or (not scoring and inputs["custom_guide"] is None):
+                return "Continue supplied score requires source audio or an ABC file and a composition planning mode."
         if scoring and inputs["audio_guide"] is None:
             return "Upload a source song to extract its score."
         if scoring and inputs["model_mode"] == 2:
