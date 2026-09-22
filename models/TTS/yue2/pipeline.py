@@ -14,6 +14,7 @@ from shared.utils.loras_mutipliers import update_loras_slists
 
 from .modules import YuE2Config
 from .protocol import ABC_END, MUSIC_END, CONTEXT, GenerationConfig, SongRequest, token_prefixes, negative_prefix, chunk_ranges
+from .composition import composition_source
 from .sampling import YuE2LogitsProcessor
 from .tokenization_yue2 import YuE2TextTokenizer
 from .transformer import YuE2AR, YuE2Acoustic
@@ -145,14 +146,21 @@ class YuE2Pipeline:
         self.last_plan = self.last_latents = None
         self.last_truncated = {}
         mode = "melody" if self.hum is not None else ("full", "melody", "off", "full")[model_mode]
-        extend_score = self.hum is None and (custom_settings or {}).get("extend_score", 0) == 1
-        if extend_score and (mode == "off" or ("A" not in audio_prompt_type and input_custom is None)):
-            raise ValueError("Continue supplied score requires source audio or an ABC file and a composition planning mode.")
+        if self.hum is None:
+            audio_prompt_type = composition_source(audio_prompt_type, input_custom is not None)
+        extend_score = self.hum is None and "E" in audio_prompt_type
+        using_abc = "Q" in audio_prompt_type and "A" not in audio_prompt_type
+        if using_abc and input_custom is None:
+            raise ValueError("Upload an ABC score for the selected composition source.")
+        if (using_abc or "A" in audio_prompt_type) and mode == "off":
+            raise ValueError("A source score requires a composition planning mode.")
+        if extend_score and ("S" in audio_prompt_type or not (using_abc or "A" in audio_prompt_type)):
+            raise ValueError("Score extension requires an ABC score or source audio.")
         carrier = None
         midi = None
         side_files = {}
         abc = ""
-        if "A" not in audio_prompt_type and input_custom is not None:
+        if using_abc:
             abc = Path(input_custom).read_text(encoding="utf-8-sig").strip()
             if not abc:
                 raise ValueError("The ABC score file is empty.")
@@ -197,7 +205,7 @@ class YuE2Pipeline:
                     from .hum import open_hum_score
                     opening = open_hum_score(abc)
                 else:
-                    # Preserve both voices and rests; the planner continues the source score.
+                    # Keep both voices and rests when continuing the source notation.
                     opening = abc.rstrip() + "\n"
                 partial = self.tokenizer.encode(opening)
                 request = replace(request, abc=None)
