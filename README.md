@@ -63,6 +63,36 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 
 ## 🔥 Latest Updates : 
+## 20th of September 2026: WanGP v13.1313 — It's Your Lucky Day^3!
+
+- **Qwen Image 2.1**: A new Qwen Image model with out-of-the-box editing capabilities and strong text rendering. 
+
+WanGP supports *VRAM Optimization*, *Pose/Depth/Edge Transfer*, *Inpainting*, *LanPaint*, *Outpainting*, *KV Cache Acceleration*, and *Enhanced Prompts* from day one.
+
+No distilled version is available yet.
+
+- **Full JIT Checkpoint Loading**: WanGP now downloads preprocessing and postprocessing checkpoints only when needed, instead of downloading them all on first use. This saves disk space if you use WanGP for a specific task, such as audio generation, or want to build a portable version of WanGP.
+
+- **Comfy Kitchen Kernels Support**: These kernels are installed automatically and can accelerate specific models. They have been integrated into H3 and LTX2.x, which are now 10% faster.
+
+- **Minimax H3 INT8 ConvRot VAE**: Twice as fast. Now downloaded automatically and used by default when INT8 is selected in your transformer configuration. 
+
+- **Deepy Prime for the Masses**: Thanks to the new *Bonsai 2 Abliterated PTQ1_0 checkpoint*, *Deepy Prime* and its advanced *Prompt Enhancer* can now run with **10 GB of VRAM, or possibly less**. You will need *GGUF CUDA kernels 1.0.22*. Please see the installation guide.  
+
+- **UI Optimizations**: The UI should be even faster, especially the Image/Video Gallery.
+
+- **Yue2 Instrumental Model Only**: you can now generate instrumentals track only, please check new option in main dropdown box and also prompt instructions or new prompt enhancer templates. 
+
+- **Yue2 Hum to Song**: Turn a clear hummed melody, your lyrics and a music style into a new stereo song.
+
+- **YuE2 support AR LoRAs**: YuE2 first phase, is an Auto Regressive phase (score writing phase) and it can now accept LoRAs. LoRAs for second Diffusion phase was already added previously.
+
+- **DFlash2 & DSpark Acceleration for Deepy & Prompt Enhancer***: for an extra VRAM cost you will be able to generate up tp 200 tokens / s
+
+- **Various UI Improvements**: add directly the current frame of Video Gallery to the Image Gallery, Extract settings of a Video/Audio/Image in Workspace Gallery 
+
+*Update v13.1313*: Yue2 instrumental mode, Yue2 Hum to Song, AR Lora support, DFlash2 / DSpark
+
 ## 16th of September 2026: WanGP v13.10 — It's Your Lucky Day!
 
 **WanGP Major Release**

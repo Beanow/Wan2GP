@@ -16,7 +16,7 @@
       this.dialog.innerHTML = `<header><div class="wv-heading"><div class="wv-workspace-picker"><select data-workspace aria-label="Workspace"></select><button data-create aria-label="Add workspace" title="Add workspace">${svg('create')}</button></div><span data-summary></span></div><div class="wv-header-actions"><button data-retention aria-label="Automatic workspace archiving" title="Automatic workspace archiving">${svg('broom')}</button><button data-close aria-label="Close workspace viewer" title="Close (Esc)">${svg('close')}</button></div></header>
         <div class="wv-toolbar"><div role="tablist" aria-label="Workspace media"><button role="tab" data-source="video">Images / Videos</button><button role="tab" data-source="audio">Audio</button></div><span class="wv-spacer"></span><span data-activity></span><button data-protect aria-label="Protect workspace from automatic archiving" aria-pressed="false">${svg('unlock')}</button><button data-import>${svg('import')}Import</button><button data-refresh>Refresh</button><input data-files type="file" accept="image/*,video/*,audio/*" multiple hidden></div>
         <div class="wv-selection"><span data-count></span><button data-page-select>Select page</button><button data-clear>Clear selection</button><div data-actions hidden><button data-action="eject">${svg('eject')}Eject</button><button data-action="delete">${svg('delete')}Delete files</button><button data-action="copy">${svg('copy')}Copy to workspace</button><button data-action="move">${svg('move')}Move to workspace</button><button data-action="archive">${svg('archive')}ZIP</button><button data-action="first" title="Move selected media to the oldest end">Move to start</button><button data-action="last" title="Move selected media to the newest end">Move to end</button></div></div>
-        <p class="wv-notice" role="status" hidden></p><div class="wv-content"><section class="wv-browser" aria-label="Workspace media grid"><div class="wv-grid" role="listbox" aria-multiselectable="true" aria-label="Media"></div><div class="wv-empty" hidden>No media in this gallery. Import files to get started.</div><div class="wv-rubber" hidden></div></section><aside><h3>Media details</h3><div class="wv-preview"></div><iframe title="Generation properties" sandbox=""></iframe></aside></div>
+        <p class="wv-notice" role="status" hidden></p><div class="wv-content"><section class="wv-browser" aria-label="Workspace media grid"><div class="wv-grid" role="listbox" aria-multiselectable="true" aria-label="Media"></div><div class="wv-empty" hidden>No media in this gallery. Import files to get started.</div><div class="wv-rubber" hidden></div></section><aside><h3>Media details</h3><div class="wv-preview"></div><iframe title="Generation properties" sandbox=""></iframe><button data-extract-settings disabled title="Load the selected media's generation settings and close the workspace manager">Extract Settings</button></aside></div>
         <footer><span>Oldest → newest · Ctrl/⌘ click or drag on empty space to select · Drag tiles to reorder</span><button data-prev aria-label="Older page">←</button><label>Page <input data-page type="number" min="1" aria-label="Page number"></label><span data-pages></span><button data-next aria-label="Newer page">→</button></footer>`;
       document.body.append(this.dialog);
       this.grid = this.dialog.querySelector('.wv-grid'); this.browser = this.dialog.querySelector('.wv-browser');
@@ -27,13 +27,18 @@
       this.modal.querySelector('[data-cancel]').onclick = () => this.modal.close();
       this.modal.querySelector('form').onsubmit = event => {event.preventDefault(); this.confirm();};
       this.dialog.querySelector('[data-close]').onclick = () => this.dialog.close();
+      this.dialog.querySelector('[data-extract-settings]').onclick = () => {
+        if (this.busy || this.loading || this.selected.size !== 1) return;
+        window.__wangpAssistantChatNS.setBridgeValue('#wangp-workspace-extract-settings textarea', JSON.stringify({workspace: this.workspace, source: this.source, revision: this.state.revision, keys: [...this.selected], request: Date.now()}));
+        this.dialog.close();
+      };
       this.dialog.querySelector('[data-workspace]').onchange = event => this.changeWorkspace(event.target.value);
       this.dialog.querySelector('[data-create]').onclick = () => this.picker.open('create');
       this.picker.dialog.addEventListener('close', () => this.invalidate());
       this.dialog.querySelector('[data-protect]').onclick = () => this.protect();
       this.dialog.querySelector('[data-retention]').onclick = () => this.action('retention').catch(error => this.notice(error.message));
       this.dialog.onclose = () => {this.requestId++; this.detailRequest?.abort(); this.grid.replaceChildren(); this.preview.replaceChildren(); this.modal.close(); clearTimeout(this.refreshTimer); clearTimeout(this.pageHover); cancelAnimationFrame(this.rubberFrame);};
-      this.dialog.querySelectorAll('[data-source]').forEach(tab => tab.onclick = () => {if (this.source !== tab.dataset.source) {this.source = tab.dataset.source; this.detailKey = null; this.preview.replaceChildren(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.'); this.load(0);}});
+      this.dialog.querySelectorAll('[data-source]').forEach(tab => tab.onclick = () => {if (this.source !== tab.dataset.source) {this.source = tab.dataset.source; this.detailKey = null; this.preview.replaceChildren(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.'); this.load(this.pages[this.source]);}});
       this.dialog.querySelector('[data-import]').onclick = () => this.dialog.querySelector('[data-files]').click();
       this.dialog.querySelector('[data-files]').onchange = event => this.importFiles([...event.target.files]);
       this.dialog.querySelector('[data-refresh]').onclick = () => this.load(this.state?.page || 0);
@@ -63,6 +68,7 @@
       this.dialog.querySelector('[data-next]').disabled = this.busy || this.loading || !this.state || this.state.page + 1 === this.state.pages;
       this.dialog.querySelector('[data-page]').disabled = this.busy || this.loading || !this.state;
       this.dialog.querySelector('[data-protect]').disabled = this.busy || this.loading || !this.state;
+      this.dialog.querySelector('[data-extract-settings]').disabled = this.busy || this.loading || !this.state || this.selected.size !== 1;
     }
     setBusy(value) {
       this.busy = value;
@@ -91,6 +97,7 @@
     resetWorkspace() {
       clearTimeout(this.refreshTimer); this.modal.close();
       this.workspace = this.picker.state.selected; this.selections = {video: new Set(), audio: new Set()}; this.state = null; this.detailKey = null;
+      this.pages = {video: 0, audio: 0};
       this.grid.replaceChildren(); this.selectionChanged();
       this.renderWorkspaces(); this.dialog.querySelector('[data-activity]').textContent = '';
       this.dialog.querySelector('[data-summary]').textContent = '';
@@ -117,20 +124,23 @@
       clearTimeout(this.refreshTimer); this.refreshTimer = setTimeout(() => this.load(this.page || 0, true), 150);
     }
     async load(page, keepScroll = false, initial = false) {
+      clearTimeout(this.refreshTimer);
       const request = ++this.requestId;
-      this.page = page; this.loading = true; this.navigation();
+      this.page = this.pages[this.source] = page; this.loading = true; this.navigation();
       const requestedSelection = new Set(this.selected);
       try {
         const state = await this.transport.request('workspace_viewer', {workspace: this.workspace, source: this.source, page: Math.max(0, page), selected: [...this.selected], initial});
         if (request !== this.requestId || !this.dialog.open) return;
         state.items.forEach(item => {if (item.thumbnail) item.thumbnail = new URL(item.thumbnail, this.transport.base).href;});
+        this.pages[state.source] = state.page;
         this.renderActivity(state);
         if (keepScroll && this.state?.revision === state.revision && this.state.source === state.source && this.state.page === state.page) {this.state = state; this.selectionChanged(); return;}
         const retained = new Set(state.selected);
         if (initial) {this.source = state.source; this.selections[this.source] = retained; this.anchor = state.selected[0];}
         else requestedSelection.forEach(key => {if (!retained.has(key)) this.selected.delete(key);});
         this.state = state; this.page = state.page;
-        this.dialog.querySelector('[data-summary]').textContent = `${state.total} media · ${state.visible} visible in the main gallery`;
+        const range = state.items.length ? `${state.items[0].index + 1}–${state.items[state.items.length - 1].index + 1} of ${state.total} media` : '0 media';
+        this.dialog.querySelector('[data-summary]').textContent = `${range} · ${state.visible} visible in the main gallery`;
         this.dialog.querySelectorAll('[data-source]').forEach(tab => tab.setAttribute('aria-selected', String(tab.dataset.source === state.source)));
         this.grid.replaceChildren(...state.items.map(item => this.tile(item)));
         this.dialog.querySelector('.wv-empty').hidden = state.total > 0;
@@ -171,6 +181,7 @@
       this.anchor = key; this.selectionChanged(); this.showDetails(key);
     }
     selectionChanged() {
+      this.navigation();
       this.grid.querySelectorAll('[data-key]').forEach(tile => tile.setAttribute('aria-selected', String(this.selected.has(tile.dataset.key))));
       this.dialog.querySelector('[data-count]').textContent = `${this.selected.size} selected`;
       this.dialog.querySelector('[data-actions]').hidden = !this.selected.size;
