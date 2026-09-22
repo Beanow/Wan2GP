@@ -117,6 +117,9 @@ class YuE2Pipeline:
         self.last_plan = self.last_latents = None
         self.last_truncated = {}
         mode = "melody" if self.hum is not None else ("full", "melody", "off")[model_mode]
+        extend_score = self.hum is None and (custom_settings or {}).get("extend_score", 0) == 1
+        if extend_score and (mode == "off" or ("A" not in audio_prompt_type and input_custom is None)):
+            raise ValueError("Continue supplied score requires source audio or an ABC file and a composition planning mode.")
         carrier = None
         midi = None
         side_files = {}
@@ -159,9 +162,14 @@ class YuE2Pipeline:
                 offloadobj.unload_all()
                 abc, midi = score_audio(audio_guide, self.scoring_checkpoint, mode == "melody", callback, self._abort_requested)
             request = SongRequest(style=alt_prompt, lyrics=input_prompt, cot=mode, abc=abc or None, cfg_scale=guide_scale, seed=seed)
-            if self.hum is not None and model_mode == 0:
-                from .hum import open_hum_score
-                partial = self.tokenizer.encode(open_hum_score(abc))
+            if (self.hum is not None and model_mode == 0) or extend_score:
+                if self.hum is not None:
+                    from .hum import open_hum_score
+                    opening = open_hum_score(abc)
+                else:
+                    # Preserve both voices and rests; the planner continues the source score.
+                    opening = abc.rstrip() + "\n"
+                partial = self.tokenizer.encode(opening)
                 request = replace(request, abc=None)
                 continuation = self._tokens(token_prefixes(request, self.tokenizer) + partial, self.generation_config.abc, seed, "abc", callback)
                 abc_ids = partial + continuation
