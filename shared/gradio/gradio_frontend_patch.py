@@ -292,6 +292,9 @@ _PATCHES = {
         ('R.inputs.map(W=>No(W,J,K))', 'R.inputs.map((W,index)=>wangpMetadata&&index===1?wangpMetadata:No(W,J,K))'),
         ('else if(ne.stage==="error"){', 'else if(ne.stage==="error"){wangpMetadataSent.delete(S);'),
         ('if(d.closed)return;t(21,ce=[st("Error",String(ae)', 'wangpMetadataSent.delete(S);if(d.closed)return;t(21,ce=[st("Error",String(ae)'),
+        # Gradio already shows its lost-connection status. A failed request for
+        # each pending event would otherwise add the same error toast again.
+        ('if(ne.message){const ge=ne.message.replace(rf,', 'if(ne.message&&!ne.message.startsWith("Connection errored out.")){const ge=ne.message.replace(rf,'),
         ('function Jt(S,J=null,K=null){', 'function Jt(S,J=null,K=null){if(window.__wangpGradioStale)return;'),
         # Hide the API footer fragment (including its divider), not the API.
         ('y=l[5]&&Qi(l);', 'y=false;'),
@@ -427,6 +430,7 @@ def install():
     versions = {path.name: sha256(_asset(str(path)).encode()).hexdigest()[:16] for path in asset_paths if path != _EDITOR_PATH}
     original_template = routes.templates.TemplateResponse
     session_script = Path(__file__).with_name('session_guard.js').read_text(encoding='utf-8')
+    proxy_root_script = Path(__file__).with_name('proxy_root.js').read_text(encoding='utf-8')
 
     @wraps(original_template)
     def template_response(*args, **kwargs):
@@ -434,6 +438,7 @@ def install():
         source = response.body.decode('utf-8')
         patched = _version_html(source, versions)
         if patched != source:
+            patched = patched.replace('<script type="importmap">', '<script>' + proxy_root_script + '</script><script type="importmap">', 1)
             config = response.context['config']
             if not config.get('auth_required'):
                 guard = session_script.replace('__WANGP_UI_SIGNATURE__', json.dumps(config['wangp_ui_signature']))
