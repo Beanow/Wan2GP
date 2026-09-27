@@ -229,15 +229,24 @@ class H3FaceRefinerBridge(SimpleScaleSuffixMixin):
             raise ValueError(error)
         self.download(process_files, spatial_upsampling=spatial_upsampling)
 
+    def vae_tile_size(self, vae_config):
+        import torch
+        from models.minimax_h3.video_vae import MiniMaxH3VideoVAE
+        device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576 if torch.cuda.is_available() else 0
+        mixed_precision = self.server_config.get("vae_precision", "16") == "32"
+        return MiniMaxH3VideoVAE.get_VAE_tile_size(int(vae_config or 0), device_mem_capacity, mixed_precision)
+
     def upscale(self, sample, spatial_upsampling, *, loaded_model_context=None, prompt="", seed=0, fps=24.0, frame_offset=0,
                 audio_waveform=None, audio_sample_rate=0, source_audio_path=None, vae_tile_size=None, still_image=False,
                 reference_images=None, image_refs_relative_size=100.0, face_count=1, strength=0.75,
-                abort_callback=None, progress_callback=None, profile=-1, **kwargs):
+                abort_callback=None, progress_callback=None, profile=-1, vae_config=0, **kwargs):
         if still_image:
             raise ValueError("H3 Face Refiner is available for videos only")
         error = self.validate_upsampling(spatial_upsampling, 0)
         if error:
             raise ValueError(error)
+        # The incoming vae_tile_size was computed for the main model's VAE, which may not be the H3 VAE.
+        vae_tile_size = self.vae_tile_size(vae_config)
         import wgp
         from .face import crop_face_track, frames_to_sample, sample_to_frames, select_reference_frame, stitch, track_faces
         from .runtime import RUNTIME, load_model, refine_video, window_starts
