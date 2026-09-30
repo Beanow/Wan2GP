@@ -25,6 +25,11 @@ CONTAINER_AUDIO_CODEC_KEYS = {
     "mp4": QUICKTIME_AUDIO_CODEC_KEYS | {"flac"} | OPUS_AUDIO_CODEC_KEYS,
     "mov": QUICKTIME_AUDIO_CODEC_KEYS,
 }
+# Source audio codecs each container can packet-copy; Matroska accepts any codec.
+CONTAINER_AUDIO_COPY_CODECS = {
+    "mp4": {"aac", "ac3", "alac", "eac3", "mp3", "opus"},
+    "mov": {"aac", "ac3", "alac", "eac3", "mp3", "pcm_s16le", "pcm_s24le", "pcm_s32le"},
+}
 
 
 def normalize_video_container(container: str | None) -> str:
