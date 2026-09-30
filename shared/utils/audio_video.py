@@ -69,7 +69,8 @@ def resample_audio_array(audio_data, source_sample_rate, target_sample_rate):
     return (resampled.T if audio_array.ndim == 2 else resampled[0]).astype(np.float32, copy=False)
 
 
-def append_sliding_window_audio(existing_audio_data, existing_audio_path, generated_audio, audio_sampling_rate, committed_audio_samples, existing_audio_sample_rate=None):
+def append_sliding_window_audio(existing_audio_data, existing_audio_path, generated_audio, audio_sampling_rate, committed_audio_samples, existing_audio_sample_rate=None, prefix_start_samples=0, keep_existing=False, trim_ranges=(), video_fps=None):
+    # keep_existing: a kept soundtrack also replaces the generated audio of the current window for as long as it lasts
     generated_audio = np.asarray(generated_audio, dtype=np.float32)
     if generated_audio.size == 0:
         return generated_audio
@@ -82,7 +83,10 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
         return generated_audio
     if prefix_sample_rate != int(audio_sampling_rate):
         prefix_audio = resample_audio_array(prefix_audio, prefix_sample_rate, audio_sampling_rate)
-    prefix_audio = prefix_audio[:max(0, int(committed_audio_samples))]
+    prefix_start_samples, committed_audio_samples = max(0, int(prefix_start_samples)), max(0, int(committed_audio_samples))
+    prefix_audio = prefix_audio[prefix_start_samples:]
+    prefix_audio = trim_audio_ranges(prefix_audio, trim_ranges, video_fps, audio_sampling_rate)
+    prefix_audio = prefix_audio[:committed_audio_samples + (generated_audio.shape[0] if keep_existing else 0)]
     if prefix_audio.size == 0:
         return generated_audio
     if prefix_audio.ndim != generated_audio.ndim:
@@ -90,7 +94,7 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
         generated_audio = generated_audio[:, None] if generated_audio.ndim == 1 else generated_audio
     if prefix_audio.ndim == 2 and prefix_audio.shape[1] != generated_audio.shape[1]:
         prefix_audio = np.repeat(prefix_audio[:, :1], generated_audio.shape[1], axis=1) if prefix_audio.shape[1] == 1 else prefix_audio[:, :generated_audio.shape[1]]
-    return np.concatenate([prefix_audio, generated_audio], axis=0)
+    return np.concatenate([prefix_audio, generated_audio[max(0, prefix_audio.shape[0] - committed_audio_samples):]], axis=0)
 
 
 def create_silent_wav_file(output_dir=None, duration_seconds=0.0, sample_rate=16000, prefix="null_audio_"):
@@ -286,6 +290,10 @@ def _get_audio_codec_settings(codec_key):
         "mp3_128": {"ext": "mp3", "format": "mp3", "bitrate": "128k"},
         "mp3_192": {"ext": "mp3", "format": "mp3", "bitrate": "192k"},
         "mp3_320": {"ext": "mp3", "format": "mp3", "bitrate": "320k"},
+        "opus_64": {"ext": "opus", "format": "opus", "bitrate": "64k"},
+        "opus_96": {"ext": "opus", "format": "opus", "bitrate": "96k"},
+        "opus_128": {"ext": "opus", "format": "opus", "bitrate": "128k"},
+        "opus_192": {"ext": "opus", "format": "opus", "bitrate": "192k"},
     }
     return settings.get(codec_key, settings["wav"])
 
@@ -299,6 +307,10 @@ def get_mp4_audio_codec_settings(codec_key):
         "aac_320": {"codec": "aac", "bitrate": "320k", "ext": ".aac"},
         "alac": {"codec": "alac", "bitrate": None, "ext": ".m4a"},
         "flac": {"codec": "flac", "bitrate": None, "ext": ".flac", "sample_fmt": "s16"},
+        "opus_64": {"codec": "libopus", "bitrate": "64k", "ext": ".opus", "sample_rate": 48000, "vbr": "on"},
+        "opus_96": {"codec": "libopus", "bitrate": "96k", "ext": ".opus", "sample_rate": 48000, "vbr": "on"},
+        "opus_128": {"codec": "libopus", "bitrate": "128k", "ext": ".opus", "sample_rate": 48000, "vbr": "on"},
+        "opus_192": {"codec": "libopus", "bitrate": "192k", "ext": ".opus", "sample_rate": 48000, "vbr": "on"},
     }
     return settings.get(codec_key, settings["aac_128"])
 
@@ -310,6 +322,10 @@ def get_video_audio_encode_args(codec_key):
         args += ["-b:a", settings["bitrate"]]
     if settings.get("sample_fmt"):
         args += ["-sample_fmt", settings["sample_fmt"]]
+    if settings.get("sample_rate"):
+        args += ["-ar", str(settings["sample_rate"])]
+    if settings.get("vbr"):
+        args += ["-vbr", settings["vbr"]]
     return args
 
 
@@ -377,16 +393,19 @@ def get_audio_codec_extension(codec_key):
     return _get_audio_codec_settings(codec_key)["ext"]
 
 
-def _run_ffmpeg_encode(input_path, output_path, codec, bitrate=None, sample_rate=None, drop_video=False):
-    cmd = [_ffmpeg_binary(), "-y", "-v", "error", "-i", input_path]
-    if drop_video:
-        cmd.append("-vn")
-    cmd += ["-c:a", codec]
-    if bitrate:
-        cmd += ["-b:a", bitrate]
-    if sample_rate:
-        cmd += ["-ar", str(int(sample_rate))]
-    cmd.append(output_path)
+def get_standalone_audio_encode_args(codec_key):
+    settings = _get_audio_codec_settings(codec_key)
+    if settings["format"] == "opus":
+        return get_video_audio_encode_args(codec_key)
+    if settings["format"] == "flac":
+        return ["-c:a", "flac", "-sample_fmt", "s16"]
+    if settings["format"] == "wav":
+        return ["-c:a", "pcm_s16le"]
+    return ["-c:a", "libmp3lame", "-b:a", settings["bitrate"]]
+
+
+def _run_ffmpeg_encode(input_path, output_path, encode_args):
+    cmd = [_ffmpeg_binary(), "-y", "-v", "error", "-i", input_path, *encode_args, output_path]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
@@ -404,7 +423,7 @@ def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
     os.close(fd)
     try:
         write_wav_file(tmp_path, audio_data, sample_rate)
-        _run_ffmpeg_encode(tmp_path, path, "libmp3lame", bitrate=settings.get("bitrate"), sample_rate=sample_rate)
+        _run_ffmpeg_encode(tmp_path, path, get_standalone_audio_encode_args(codec_key))
     finally:
         try:
             os.remove(tmp_path)
@@ -533,6 +552,10 @@ def extract_audio_tracks(source_video, verbose=False, query_only=False, codec_ke
             output_kwargs['b:a'] = audio_settings["bitrate"]
         if audio_settings.get("sample_fmt"):
             output_kwargs['sample_fmt'] = audio_settings["sample_fmt"]
+        if audio_settings.get("sample_rate"):
+            output_kwargs['ar'] = audio_settings["sample_rate"]
+        if audio_settings.get("vbr"):
+            output_kwargs['vbr'] = audio_settings["vbr"]
         ffmpeg.input(source_path, **time_args).output(temp_path, **output_kwargs).overwrite_output().run(cmd=_ffmpeg_binary(), quiet=not verbose)
 
     return file_paths, metadata
@@ -548,7 +571,11 @@ def combine_and_concatenate_video_with_audio_tracks(
     audio_codec_key="aac_128",
     verbose = False
 ):
-    audio_codec = get_mp4_audio_codec_settings(audio_codec_key)["codec"]
+    audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
+    audio_codec = audio_settings["codec"]
+    audio_encode_args = get_video_audio_encode_args(audio_codec_key)
+    if not audio_settings.get("sample_rate"):
+        audio_encode_args += ["-ar", str(audio_sampling_rate)]
     inputs, filters, maps, idx = ['-i', video_path], [], ['-map', '0:v'], 1
     metadata_args = []
     sources = source_audio_tracks or []
@@ -615,8 +642,7 @@ def combine_and_concatenate_video_with_audio_tracks(
            '-filter_complex', ';'.join(filters),  # ✅ Only change made
            *maps, *metadata_args,
            '-c:v', 'copy',
-           *get_video_audio_encode_args(audio_codec_key),
-           '-ar', str(audio_sampling_rate),
+           *audio_encode_args,
            '-shortest', save_path_tmp]
 
     if verbose:

@@ -327,6 +327,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=ui_studio.THEME_CHOICES,
                         value=self.server_config.get("UI_theme", "default"), label="UI Theme (requires restart)"
                     )
+                    self.floating_generate_button_choice = gr.Checkbox(
+                        value=self.server_config.get("floating_generate_button", True),
+                        label="Enable Floating Generate Button (requires restart)",
+                        info="Keep generation controls visible on the right until they reach their place below the gallery. Also enables floating Edit Mode controls.",
+                        interactive=not self.args.lock_config
+                    )
                     self.queue_color_scheme_choice = gr.Dropdown(
                         choices=[
                             ("Pastel (Unique color for each item)", "pastel"),
@@ -628,12 +634,16 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.image_output_codec_choice = gr.Dropdown(choices=[("JPEG Q85", 'jpeg_85'), ("WEBP Q85", 'webp_85'), ("JPEG Q95", 'jpeg_95'), ("WEBP Q95", 'webp_95'), ("WEBP Lossless", 'webp_lossless'), ("PNG Lossless", 'png')], value=self.server_config.get("image_output_codec", "jpeg_95"), label="Image Codec")
                     self.audio_output_codec_choice = gr.Dropdown(
                         choices=[
-                            ("AAC 128 kbps", "aac_128"),
-                            ("AAC 192 kbps", "aac_192"),
-                            ("AAC 256 kbps (High Quality, Recommended)", "aac_256"),
                             ("AAC 320 kbps (Very High Quality)", "aac_320"),
+                            ("AAC 256 kbps (High Quality, Recommended)", "aac_256"),
+                            ("AAC 192 kbps", "aac_192"),
+                            ("AAC 128 kbps", "aac_128"),
+                            ("Opus 192 kbps (Very High Quality)", "opus_192"),
+                            ("Opus 128 kbps (High Quality, Recommended)", "opus_128"),
+                            ("Opus 96 kbps", "opus_96"),
+                            ("Opus 64 kbps", "opus_64"),
+                            ("FLAC Lossless (playback compatibility may be limited)", "flac"),
                             ("ALAC Lossless (preview/playback compatibility may be limited)", "alac"),
-                            ("FLAC Lossless (MP4/MKV only, playback compatibility may be limited)", "flac"),
                         ],
                         value=self.server_config.get("audio_output_codec", "aac_128"),
                         visible=True,
@@ -646,9 +656,13 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=[
                             ("WAV (Lossless)", "wav"),
                             ("FLAC (Lossless)", "flac"),
-                            ("MP3 128 kbps", "mp3_128"),
-                            ("MP3 192 kbps", "mp3_192"),
+                            ("Opus 192 kbps (Very High Quality)", "opus_192"),
+                            ("Opus 128 kbps (High Quality, Recommended)", "opus_128"),
+                            ("Opus 96 kbps", "opus_96"),
+                            ("Opus 64 kbps", "opus_64"),
                             ("MP3 320 kbps", "mp3_320"),
+                            ("MP3 192 kbps", "mp3_192"),
+                            ("MP3 128 kbps", "mp3_128"),
                         ],
                         value=audio_standalone_default,
                         visible=True,
@@ -801,7 +815,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.transformer_types_choices, self.model_hierarchy_type_choice, self.fit_canvas_choice,
             self.attention_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
-            self.UI_theme_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice,
+            self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
             self.text_encoder_quantization_choice, self.lm_decoder_engine_choice, self.VAE_precision_choice, self.compile_choice,
             self.depth_anything_v2_variant_choice,
@@ -896,7 +910,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             transformer_types_choices, model_hierarchy_type_choice, fit_canvas_choice,
             attention_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
-            UI_theme_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice,
+            UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
             text_encoder_quantization_choice, lm_decoder_engine_choice, VAE_precision_choice, compile_choice,
             depth_anything_v2_variant_choice,
@@ -1024,6 +1038,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "multi_prompts_gen_type": prompt_parser.normalize_multi_prompts_mode(multi_prompts_gen_type_choice, default=prompt_parser.DEFAULT_MULTI_PROMPTS_MODE),
             "keep_intermediate_sliding_windows": keep_intermediate_sliding_windows_choice,
             "preload_model_policy": preload_model_policy_choice, "UI_theme": UI_theme_choice,
+            "floating_generate_button": floating_generate_button_choice,
             "fit_canvas": fit_canvas_choice,
             LLM_CONFIG_KEY: llm_config_choice,
             "enhancer_mode": enhancer_mode_choice,
@@ -1138,7 +1153,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             LLM_CONFIG_KEY,
             "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
-            "model_hierarchy_type", "UI_theme", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY
+            "model_hierarchy_type", "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY
         ]
 
         needs_reload = not all(change in no_reload_keys for change in changes)
