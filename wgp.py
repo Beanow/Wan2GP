@@ -5984,6 +5984,9 @@ def edit_media(
 
     if gen.get("abort", False): return 
     abort = False
+    # Edit mode runs no generation, so set the configured attention mode here; otherwise post-processing models
+    # inherit a stale mode from the last generation or fall back to the hardware default (e.g. sage, which fails on some head dims).
+    offload.shared_state["_attention"] = get_auto_attention() if attention_mode == "auto" else attention_mode
 		
 		
     postprocess_audio = audio_processor_api.normalize_method(postprocess_audio or "")
