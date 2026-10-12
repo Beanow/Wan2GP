@@ -12,6 +12,11 @@ _reported = False
 _rope_reported = False
 
 
+def _is_sm120(device):
+    # ROCm reports gfx12 GPUs as capability (12, 0) too; these kernels use CUDA libdevice.
+    return torch.version.hip is None and torch.cuda.get_device_capability(device) == (12, 0)
+
+
 def project_many(modules, x):
     global _reported
     if not torch.compiler.is_compiling() and ENABLED and x.is_contiguous() and all(int8_backend.can_fuse_linear(m, x) for m in modules):
@@ -33,7 +38,7 @@ def scale_shift(x, scale, shift, in_place):
             or scale.shape[0] != x.shape[0] or scale.shape[-1] != x.shape[-1]
             or scale.shape[1] == 0 or x.shape[1] % scale.shape[1]
             or not all(t.is_contiguous() for t in (x, scale, shift))
-            or torch.cuda.get_device_capability(x.device) != (12, 0)):
+            or not _is_sm120(x.device)):
         return None
     return denoiser_triton.scale_shift(x, scale, shift, in_place)
 
@@ -48,7 +53,7 @@ def split_rope(x, cache, layout, head_start=0, dim_head=None):
             or not 1 <= len(layout.grid_sizes) <= 3
             or not 0 <= cache.pad_size < len(layout.axis_cos)
             or (x.shape[0] > 1 and x.stride(0) < x.shape[1] * x.shape[2])
-            or torch.cuda.get_device_capability(x.device) != (12, 0)):
+            or not _is_sm120(x.device)):
         return False
     dtype = torch.float32 if cache.use_fp32_freqs else x.dtype
     if any(t.device != x.device or t.dtype != dtype or not t.is_contiguous()
