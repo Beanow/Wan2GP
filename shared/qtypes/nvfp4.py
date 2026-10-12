@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
 import os
 import torch
@@ -177,7 +178,6 @@ def set_nvfp4_backend(name):
     _NVFP4_LOGGED_BACKENDS.clear()
     _NVFP4_KERNEL_LOGGED = False
     _NVFP4_LOAD_LOGGED = False
-    _init_nvfp4_kernel_support()
 
 
 def _nvfp4_note_kernel(backend):
@@ -210,6 +210,7 @@ def _nvfp4_note_reset():
 
 def _nvfp4_note_load_backend():
     global _NVFP4_LOAD_LOGGED
+    _init_nvfp4_kernel_support()  # when NVFP4 weights load, never during compilation: the probe keeps a kernel workspace in VRAM
     if _NVFP4_LOAD_LOGGED:
         return
     _NVFP4_LOAD_LOGGED = True
@@ -294,9 +295,6 @@ def _supports_nvfp4_kernel(device):
     return _NVFP4_KERNEL_AVAILABLE
 
 
-_init_nvfp4_kernel_support()
-
-
 def _is_fake_tensor(tensor):
     return isinstance(tensor, _TorchFakeTensor)
 
@@ -341,12 +339,14 @@ def _nvfp4_can_use_kernel(input, weight):
         return False
     if _is_fake_tensor(input):
         return True
-    try:
-        if not torch.isfinite(weight._input_global_scale).all():
-            return False
-    except Exception:
-        return False
-    return True
+    finite = weight.__dict__.get("_finite_input_scale")
+    if finite is None:  # checked once per weight: a device sync on every call otherwise, which CUDA graphs cannot capture
+        try:
+            finite = bool(torch.isfinite(weight._input_global_scale).all())
+        except Exception:
+            finite = False
+        weight._finite_input_scale = finite
+    return finite
 
 
 def _nvfp4_get_act_scale(device):

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import atexit
@@ -1474,3 +1475,8 @@ def scaled_int8_mm(
         hip_mode=_HIP_BACKEND and k < 128,
     )
     return out
+
+
+from shared.kernels.triton_compilation_log import install_triton_compilation_logger, log_compilation_tuning
+install_triton_compilation_logger()
+_autotune_config = log_compilation_tuning(_autotune_config)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from copy import copy
-from types import MethodType
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -45,43 +44,13 @@ _FLA_PREFILL_AUTOTUNE_CONFIGURED = False
 
 
 def configure_qwen35_fla_prefill_autotune(device: torch.device) -> None:
-    """Share upstream FLA norm autotuning across representative prefill ranges."""
+    """Configure the shared FLA inference kernels before the first forward."""
     global _FLA_PREFILL_AUTOTUNE_CONFIGURED
     if _FLA_PREFILL_AUTOTUNE_CONFIGURED or _DEFAULT_FUSED_RMSNORM_GATED is None:
         return
-    from fla.modules.l2norm import l2norm_fwd_kernel
-    from fla.modules.fused_norm_gate import layer_norm_gated_fwd_kernel
-
-    def range_key(nb: int) -> int:
-        return 1 if nb == 1 else 2 if nb <= 15 else 16 if nb <= 24 else 25
-
-    def install(autotuner) -> None:
-        original_run = autotuner.run
-        original_bench = autotuner._bench
-        tuning = {"active": False, "range": 0}
-
-        def bench(_self, *args, **kwargs):
-            if not tuning["active"]:
-                tuning["active"] = True
-                print(f"[Deepy][Triton] Autotuning {autotuner.base_fn.__name__} for NB range {tuning['range']}...")
-            return original_bench(*args, **kwargs)
-
-        def run(_self, *args, **kwargs):
-            kwargs["NB"] = range_key(int(kwargs["NB"]))
-            tuning["active"] = False
-            tuning["range"] = kwargs["NB"]
-            result = original_run(*args, **kwargs)
-            if tuning["active"]:
-                print(f"[Deepy][Triton] Autotuned {autotuner.base_fn.__name__} for NB range {tuning['range']} in {autotuner.bench_time:.2f}s: {autotuner.best_config}.")
-            return result
-
-        autotuner._bench = MethodType(bench, autotuner)
-        autotuner.run = MethodType(run, autotuner)
-
-    install(l2norm_fwd_kernel)
-    install(layer_norm_gated_fwd_kernel.fn)
+    from shared.kernels.fla_inference import configure_fla_inference_kernels
+    configure_fla_inference_kernels()
     _FLA_PREFILL_AUTOTUNE_CONFIGURED = True
-    print("[Deepy][Triton] FLA norm kernels use upstream autotuning shared across NB ranges 1, 2-15, 16-24, and 25+.")
 
 
 def configure_qwen35_safe_legacy_kernels(enabled: bool) -> None:
@@ -821,12 +790,15 @@ class Qwen3_5Block(nn.Module):
             self.recurrent_state_buffer = torch.empty(0)
             self.speculative_conv_state_buffer = torch.empty(0)
             self.speculative_recurrent_state_buffer = torch.empty(0)
+            self.speculative_replay = None
             self._gguf_interleave_ssm_ab = False
             self._gguf_v_head_reordered = False
             self._gguf_ssm_param_reordered = False
             self._log_ssm_a = False
             self._gdn_prepare_decode = None
             self._gdn_recurrent_raw = None
+            self._gdn_replay_verification = False
+            self._gdn_replay_probe = None
 
     def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
         if self.layer_type != "linear_attention":
@@ -871,14 +843,60 @@ class Qwen3_5Block(nn.Module):
         recurrent_shape = (int(max_verify_tokens) - 1, *self.recurrent_state_buffer.shape)
         if tuple(self.speculative_conv_state_buffer.shape) != conv_shape or self.speculative_conv_state_buffer.device != self.conv_state_buffer.device or self.speculative_conv_state_buffer.dtype != self.conv_state_buffer.dtype:
             self.speculative_conv_state_buffer = torch.empty(conv_shape, device=self.conv_state_buffer.device, dtype=self.conv_state_buffer.dtype)
-        if tuple(self.speculative_recurrent_state_buffer.shape) != recurrent_shape or self.speculative_recurrent_state_buffer.device != self.recurrent_state_buffer.device or self.speculative_recurrent_state_buffer.dtype != self.recurrent_state_buffer.dtype:
-            self.speculative_recurrent_state_buffer = torch.empty(recurrent_shape, device=self.recurrent_state_buffer.device, dtype=self.recurrent_state_buffer.dtype)
+        if self._gdn_replay_verification or (self._gdn_replay_probe is not None and self._gdn_replay_probe(self, int(max_verify_tokens))):
+            # Accepted prefixes are replayed from the state before verification: no recurrent snapshot per draft token.
+            from shared.kernels.qwen_gdn import RecurrentReplay
+            state = self.recurrent_state_buffer
+            if self.speculative_replay is None or not self.speculative_replay.fits(state, int(max_verify_tokens), state.dtype, state.dtype):
+                self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, int(max_verify_tokens), state.dtype, state.dtype)
+            self.speculative_recurrent_state_buffer = torch.empty(0)
+        else:
+            self.speculative_replay = None
+            if tuple(self.speculative_recurrent_state_buffer.shape) != recurrent_shape or self.speculative_recurrent_state_buffer.device != self.recurrent_state_buffer.device or self.speculative_recurrent_state_buffer.dtype != self.recurrent_state_buffer.dtype:
+                self.speculative_recurrent_state_buffer = torch.empty(recurrent_shape, device=self.recurrent_state_buffer.device, dtype=self.recurrent_state_buffer.dtype)
 
     def commit_speculative_state(self, processed_tokens: int, verified_tokens: int) -> None:
         if self.layer_type != "linear_attention" or processed_tokens == verified_tokens:
             return
         self.conv_state_buffer.copy_(self.speculative_conv_state_buffer[int(processed_tokens) - 1])
-        self.recurrent_state_buffer.copy_(self.speculative_recurrent_state_buffer[int(processed_tokens) - 1])
+        if self.speculative_replay is not None:
+            self.replay_speculative_state(processed_tokens)
+        else:
+            self.recurrent_state_buffer.copy_(self.speculative_recurrent_state_buffer[int(processed_tokens) - 1])
+
+    def replay_speculative_state(self, processed_tokens: int) -> None:
+        # The recurrent state the last verification held after its first processed tokens, with the same kernel and arithmetic.
+        from shared.kernels.qwen_gdn import recurrent_raw_replay
+        direct_recurrent_layout = getattr(self, "_gdn_direct_layout", True)
+        ssm_a, ssm_dt = self._recurrence_ssm_parameters(direct_recurrent_layout)
+        recurrent_raw_replay(self.speculative_replay, ssm_a, ssm_dt, int(processed_tokens), self.recurrent_state_buffer, **self._recurrence_layout(direct_recurrent_layout))
+
+    def _recurrence_ssm_parameters(self, direct_recurrent_layout: bool):
+        # The raw recurrence addresses checkpoint heads directly. Other paths
+        # retain the established materialized execution order.
+        ssm_a = self.ssm_a if direct_recurrent_layout else _maybe_reorder_gguf_ssm_param(
+            self.ssm_a,
+            interleave_halves=self._gguf_interleave_ssm_ab,
+            tiled_to_grouped=self._gguf_ssm_param_reordered,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+        )
+        ssm_a = -torch.exp(ssm_a.float()) if self._log_ssm_a else ssm_a
+        ssm_dt = self.ssm_dt if direct_recurrent_layout else _maybe_reorder_gguf_ssm_param(
+            self.ssm_dt,
+            interleave_halves=self._gguf_interleave_ssm_ab,
+            tiled_to_grouped=self._gguf_ssm_param_reordered,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+        )
+        return ssm_a, ssm_dt
+
+    def _recurrence_layout(self, direct_recurrent_layout: bool) -> dict:
+        return dict(
+            v_heads_tiled=direct_recurrent_layout and self._gguf_v_head_reordered,
+            ssm_params_tiled=direct_recurrent_layout and self._gguf_ssm_param_reordered,
+            interleave_ab=direct_recurrent_layout and self._gguf_interleave_ssm_ab,
+        )
 
     def release_sequence_state(self):
         if self.layer_type != "linear_attention":
@@ -888,6 +906,7 @@ class Qwen3_5Block(nn.Module):
             self.recurrent_state_buffer = torch.empty(0)
             self.speculative_conv_state_buffer = torch.empty(0)
             self.speculative_recurrent_state_buffer = torch.empty(0)
+            self.speculative_replay = None
 
     def _get_runtime_conv_state(self, batch_size: int, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
@@ -1030,7 +1049,8 @@ class Qwen3_5Block(nn.Module):
                              and cache_params is None and (use_precomputed_states or speculative_verify))
         direct_recurrent_layout = use_raw_recurrent and getattr(self, "_gdn_direct_layout", True)
         if speculative_verify:
-            if self.speculative_conv_state_buffer.shape[0] < seq_len - 1 or self.speculative_recurrent_state_buffer.shape[0] < seq_len - 1:
+            recurrent_capacity = self.speculative_replay.tokens - 1 if self.speculative_replay is not None else self.speculative_recurrent_state_buffer.shape[0]
+            if self.speculative_conv_state_buffer.shape[0] < seq_len - 1 or recurrent_capacity < seq_len - 1:
                 raise RuntimeError(f"Predictive state buffers do not cover a {seq_len}-token verification pass.")
 
         if self.attn_qkv_gate is not None:
@@ -1195,30 +1215,13 @@ class Qwen3_5Block(nn.Module):
                 num_v_heads=self.num_v_heads,
             )
 
-        # The raw recurrence addresses checkpoint heads directly. Other paths
-        # retain the established materialized execution order.
-        ssm_a = self.ssm_a if direct_recurrent_layout else _maybe_reorder_gguf_ssm_param(
-            self.ssm_a,
-            interleave_halves=self._gguf_interleave_ssm_ab,
-            tiled_to_grouped=self._gguf_ssm_param_reordered,
-            num_k_heads=self.num_k_heads,
-            num_v_heads=self.num_v_heads,
-        )
-        ssm_a = -torch.exp(ssm_a.float()) if self._log_ssm_a else ssm_a
-        ssm_dt = self.ssm_dt if direct_recurrent_layout else _maybe_reorder_gguf_ssm_param(
-            self.ssm_dt,
-            interleave_halves=self._gguf_interleave_ssm_ab,
-            tiled_to_grouped=self._gguf_ssm_param_reordered,
-            num_k_heads=self.num_k_heads,
-            num_v_heads=self.num_v_heads,
-        )
+        ssm_a, ssm_dt = self._recurrence_ssm_parameters(direct_recurrent_layout)
         if use_raw_recurrent:
             core_attn_out, last_recurrent_state = self._gdn_recurrent_raw(
                 query, key, value, a, b, ssm_a, ssm_dt, recurrent_state,
-                self.speculative_recurrent_state_buffer if speculative_verify else None,
-                v_heads_tiled=direct_recurrent_layout and self._gguf_v_head_reordered,
-                ssm_params_tiled=direct_recurrent_layout and self._gguf_ssm_param_reordered,
-                interleave_ab=direct_recurrent_layout and self._gguf_interleave_ssm_ab,
+                self.speculative_recurrent_state_buffer if speculative_verify and self.speculative_replay is None else None,
+                self.speculative_replay if speculative_verify else None,
+                **self._recurrence_layout(direct_recurrent_layout),
             )
             g = beta = None
         elif self._gdn_prepare_decode is not None and use_precomputed_states and is_cuda:

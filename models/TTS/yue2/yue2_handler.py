@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -258,7 +259,7 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         definition = {
-            "group": "music", "audio_only": True, "image_outputs": False, "sliding_window": False, "supports_early_stop": True,
+            "group": "music", "audio_only": True, "image_outputs": False, "sliding_window": False, "supports_early_stop": True, "device_explicit": True,
             "enabled_audio_lora": True,
             "guidance_max_phases": 1, "no_negative_prompt": True, "inference_steps": True,
             "temperature": True, "top_k_slider": True, "top_p_slider": True, "embedded_guidance": False, "planner": asdict(GenerationConfig().abc),
@@ -309,7 +310,8 @@ class family_handler:
                 "specialities": [{"name": "hum to song", "aliases": ["humming to song"], "description": "Create a song from a hummed melody, lyrics and music style."}],
             })
             definition.pop("custom_guide")
-        return definition
+        from models.help_shared import merge_help, specialities
+        return merge_help(definition, {"specialities": specialities("music generation")})
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):

@@ -1,7 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
-# I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
-# Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import math
 from einops import rearrange
 import torch
@@ -13,6 +11,7 @@ import numpy as np
 from typing import Union,Optional
 from mmgp import offload
 from mmgp.offload import get_cache, clear_caches
+from shared import attention_kit
 from shared.attention import pay_attention
 from torch.backends.cuda import sdp_kernel
 from ..multitalk.multitalk_utils import get_attn_map_with_target
@@ -37,7 +36,7 @@ def sinusoidal_embedding_1d(dim, position):
 
     # calculation
     sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+        position, torch.pow(10000, -torch.arange(half, device=position.device).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
@@ -162,6 +161,19 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if in_place and x.is_contiguous():  # float32 statistics by chunks of rows: the same values without a float32 copy of x
+            rows = x.view(-1, x.shape[-1])
+            step = max(1, (64 << 20) // (rows.shape[-1] * 4))
+            for start in range(0, rows.shape[0], step):
+                part = rows[start:start + step]
+                y = part.float()
+                y.pow_(2)
+                y = y.mean(dim=-1, keepdim=True)
+                y += self.eps
+                y.rsqrt_()
+                part *= y
+            x *= self.weight
+            return x
         y = x.float()
         y.pow_(2)
         y = y.mean(dim=-1, keepdim=True)
@@ -212,7 +224,7 @@ class WanLayerNorm(nn.LayerNorm):
         return x
         # return super().forward(x).type_as(x)
 
-from .posemb_layers import apply_rotary_emb, get_rotary_pos_embed, apply_rotary_source_id
+from .posemb_layers import apply_rotary_emb, apply_rotary_emb_single, get_rotary_pos_embed, apply_rotary_source_id
 
 class WanSelfAttention(nn.Module):
 
@@ -306,6 +318,19 @@ class WanSelfAttention(nn.Module):
         else:
             return x, None
     
+    def _norm_rope_(self, query, key, group, freqs):
+        """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place."""
+        for tensor, norm, heads, index in ((query, self.norm_q, group.q, 0), (key, self.norm_k, group.kv, 1)):
+            if tensor is None:
+                continue
+            rows = tensor.flatten(2)
+            if group.mean_squares is None:
+                norm(rows)
+            else:
+                rows.mul_(group.mean_squares[index].add(norm.eps).rsqrt_())
+                rows.mul_(norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
+            apply_rotary_emb_single([tensor], freqs, head_first=False)
+
     def forward(self, xlist, grid_sizes, freqs, block_mask = None, ref_target_masks = None, ref_images_count = 0, standin_phase =-1, lynx_ref_buffer = None, lynx_ref_scale = 0, sub_x_no=0):
         r"""
         Args:
@@ -313,6 +338,12 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        if (block_mask is None and ref_target_masks is None and standin_phase < 1 and lynx_ref_buffer is None and isinstance(freqs, tuple)
+                and not offload.shared_state.get("_chipmunk", False) and not offload.shared_state.get("_radial", False)):
+            x = attention_kit.qkv_attention(xlist, self.q, self.k, self.v, self.num_heads, self.head_dim,
+                                            lambda query, key, group: self._norm_rope_(query, key, group, freqs),
+                                            norm_spans_heads=isinstance(self.norm_q, WanRMSNorm))
+            return self.o(x.flatten(2)), None
         x = xlist[0]
         xlist.clear()
 
@@ -697,13 +728,14 @@ class WanAttentionBlock(nn.Module):
 
         y_shape = y.shape
         y = y.view(-1, y_shape[-1])
-        chunk_size = int(y.shape[0]/2.7)
+        chunk_size = max(1, int(y.shape[0]/5.4)) # expanded chunks of about half the hidden states
         chunks =torch.split(y, chunk_size)
         for y_chunk  in chunks:
             mlp_chunk = ffn(y_chunk)
-            mlp_chunk = gelu(mlp_chunk)
+            for part in torch.split(mlp_chunk, max(1, (64 << 20) // (mlp_chunk.shape[-1] * mlp_chunk.element_size()))):
+                part.copy_(gelu(part)) # in place by rows: the same values without a second expanded chunk
             y_chunk[...] = ffn2(mlp_chunk)
-            del mlp_chunk 
+            del mlp_chunk
         y = y.view(y_shape)
         y = y.to(dtype)
         x, y = reshape_latent(x , latent_frames), reshape_latent(y , latent_frames)
@@ -844,13 +876,15 @@ class Head(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
-    def forward(self, x, e):
+    def forward(self, x_list, e):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
         # assert e.dtype == torch.float32
+        x = x_list[0]  # handed off: the hidden states are released once normalized, before the float32 copy
+        x_list.clear()
         dtype = x.dtype
 
         latent_frames = e.shape[0]
@@ -1085,6 +1119,10 @@ class WanModel(ModelMixin, ConfigMixin):
                  vista4d = False,
                  vista4d_positional_embedding_offset = 31,
                  shotplan = False,
+                 add_control_adapter = False,
+                 in_dim_control_adapter = 24,
+                 downscale_factor_control_adapter = 8,
+                 uni3c_controlnet = None,
                  ):
 
         super().__init__()
@@ -1218,6 +1256,14 @@ class WanModel(ModelMixin, ConfigMixin):
             from ..vista4d.runtime import add_vista4d_modules
             add_vista4d_modules(self)
 
+        if add_control_adapter: # Wan Fun Control-Camera
+            from ..camera_control.fun_camera import SimpleAdapter
+            self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], downscale_factor=downscale_factor_control_adapter)
+
+        if uni3c_controlnet is not None:
+            from ..camera_control.uni3c import Uni3CControlNet
+            self.uni3c = Uni3CControlNet(in_dim, dim, patch_size=patch_size, **uni3c_controlnet)
+
         if fantasytalking_dim > 0:
             from ..fantasytalking.model import WanCrossAttentionProcessor
             for block in self.blocks:
@@ -1322,10 +1368,18 @@ class WanModel(ModelMixin, ConfigMixin):
             setattr(target, "face_adapter_fuser_blocks", module )
         delattr(self, "face_adapter")
 
+    def adapt_uni3c_model(self):
+        # each Uni3C ControlNet block runs with the main block it feeds, so that mmgp loads them together
+        for block, uni3c_block in zip(self.blocks, self.uni3c.blocks):
+            block.uni3c = uni3c_block
+        self.uni3c_layers = len(self.uni3c.blocks)
+        del self.uni3c.blocks
+
     def apply_post_init_changes(self):
         self.adapt_modulation()
         if hasattr(self, "vace_blocks"): self.adapt_vace_model()
         if hasattr(self, "face_adapter"): self.adapt_animate_model()
+        if hasattr(self, "uni3c"): self.adapt_uni3c_model()
 
     def lock_layers_dtypes(self, hybrid_dtype = None, dtype = torch.float32):
         layer_list = [self.head, self.head.head, self.head.modulation, self.patch_embedding]
@@ -1356,6 +1410,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if hasattr(self, "latent_encoder"):
             layer_list += [module for module in self.latent_encoder.modules() if isinstance(module, (nn.Conv3d, nn.Linear))]
+
+        if hasattr(self, "uni3c"):
+            layer_list += self.uni3c.fp32_layers()
 
         target_dype2 = hybrid_dtype if hybrid_dtype != None else dtype 
 
@@ -1540,6 +1597,8 @@ class WanModel(ModelMixin, ConfigMixin):
         animate2_ref_freqs = None,
         animate2_log_scale = 0.0,
         animate2_kv_cache = "Disabled",
+        camera_adapter_features = None,
+        uni3c_condition = None,
     ):
         # patch_dtype =  self.patch_embedding.weight.dtype
         modulation_dtype = self.time_projection[1].weight.dtype
@@ -1560,6 +1619,7 @@ class WanModel(ModelMixin, ConfigMixin):
         x = None
         output_slice = None
         output_grid_sizes = None
+        uni3c_x = None
         joint_pass = len(x_list) > 1
         is_source_x = [False] * len(x_list) if bernini_sources is not None else [ x.data_ptr() == x_list[0].data_ptr() and i > 0 for i, x in enumerate(x_list) ]
         last_x_idx  = 0
@@ -1606,13 +1666,17 @@ class WanModel(ModelMixin, ConfigMixin):
                     scail2_ref_latent = torch.cat([scail2_ref_latent, ref_mask], dim=1)
                     x = torch.cat([scail2_ref_latent.to(device=x.device, dtype=x.dtype), x], dim=2)
                     output_slice = slice(scail2_ref_latent.shape[2], scail2_ref_latent.shape[2] + real_latent_frames)
+                if uni3c_condition is not None and i == 0: # Uni3C ControlNet input: noisy latents and i2v mask, then the render latents
+                    render_latents = uni3c_condition["render_latents"]
+                    uni3c_x = self.uni3c.embed(torch.cat([x[:1, :x.shape[1] - render_latents.shape[1]], render_latents.to(x)], dim=1), uni3c_condition["condition_features"])
+                    render_latents = None
                 # embeddings
                 if bernini_enabled:
                     source_tokens, cos_parts, sin_parts = [], [], []
                     for source_latent, source_id in bernini_sources[i]:
                         source_latent = source_latent.to(device=device, dtype=self.patch_embedding.weight.dtype)
                         source_tokens_i = self.patch_embedding(source_latent).to(modulation_dtype).flatten(2).transpose(1, 2)
-                        source_freqs = apply_rotary_source_id(get_rotary_pos_embed(tuple(source_latent.shape[2:])), source_id, self.dim // self.num_heads)
+                        source_freqs = apply_rotary_source_id(get_rotary_pos_embed(tuple(source_latent.shape[2:]), device=source_latent.device), source_id, self.dim // self.num_heads)
                         source_freqs = (source_freqs[0].to(device), source_freqs[1].to(device))
                         source_tokens.append(source_tokens_i)
                         cos_parts.append(source_freqs[0])
@@ -1620,7 +1684,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     x = self.patch_embedding(x).to(modulation_dtype)
                     grid_sizes = x.shape[2:]
                     x = x.flatten(2).transpose(1, 2)
-                    target_freqs = freqs if freqs is not None else get_rotary_pos_embed(tuple(grid_sizes))
+                    target_freqs = freqs if freqs is not None else get_rotary_pos_embed(tuple(grid_sizes), device=x.device)
                     target_freqs = (target_freqs[0].to(device), target_freqs[1].to(device))
                     bernini_freqs_list.append((torch.cat([target_freqs[0]] + cos_parts, dim=0), torch.cat([target_freqs[1]] + sin_parts, dim=0)))
                     bernini_output_slices.append(slice(0, x.shape[1]))
@@ -1629,6 +1693,8 @@ class WanModel(ModelMixin, ConfigMixin):
                     source_tokens = cos_parts = sin_parts = None
                 elif not steadydancer:
                     x = self.patch_embedding(x).to(modulation_dtype)
+                    if camera_adapter_features is not None:
+                        x += camera_adapter_features
                     if scail2_ref_mask is not None:
                         scail2_ref_mask = scail2_ref_mask.unsqueeze(0) if scail2_ref_mask.ndim == 4 else scail2_ref_mask
                         if scail2_ref_mask.shape[0] != bz:
@@ -2001,6 +2067,10 @@ class WanModel(ModelMixin, ConfigMixin):
                     if not standin_cache_enabled: get_cache("standin").clear()
                     standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
 
+                uni3c_block = block.uni3c if uni3c_x is not None and block_idx < self.uni3c_layers else None
+                if uni3c_block is not None: # shared by all the guidance branches: the ControlNet does not see the text
+                    uni3c_x = uni3c_block(uni3c_x, e, uni3c_condition["freqs"])
+
                 if animate2_enabled:
                     animate2_generation = {
                         "x_list": x_list,
@@ -2036,6 +2106,12 @@ class WanModel(ModelMixin, ConfigMixin):
                             x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
                             del x
                     context = hints = None
+
+                if uni3c_block is not None:
+                    uni3c_hint = uni3c_block.proj_out(uni3c_x)
+                    for i, should_calc in enumerate(x_should_calc):
+                        if should_calc: x_list[i] += uni3c_hint
+                    uni3c_hint = None
 
         if animate2_enabled:
             animate2_ref_hidden = animate2_ref_context_emb = animate2_ref_e0 = animate2_ref_freqs = None
@@ -2080,7 +2156,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 x = x[:, :real_seq]
 
             # head
-            x = self.head(x, e)
+            head_input, x = [x], None
+            x = self.head(head_input, e)
 
             # unpatchify
             x = self.unpatchify(x, output_grid_sizes if output_grid_sizes is not None else grid_sizes)
