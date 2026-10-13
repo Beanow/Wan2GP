@@ -17,6 +17,11 @@ def write_json(name, value):
 
 def main():
     from models.minimax_h3 import attention_experiment as experiment
+    from models.minimax_h3 import kitchen_attention
+
+    # Instrument the production callback only in this standalone benchmark.
+    kitchen_attention.callback = experiment.callback
+    kitchen_attention.attention = experiment.attention
 
     torch.manual_seed(123)
     tensors = [torch.randn(1, 257, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]

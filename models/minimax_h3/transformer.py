@@ -29,7 +29,7 @@ from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
 from . import denoiser_kernels
-from . import attention_experiment
+from . import kitchen_attention
 from shared.kernels import int8_backend
 from .pdd import MiniMaxH3ParallelHead
 from .sol_attention import MiniMaxH3SolAttention
@@ -295,7 +295,7 @@ class Attention(nn.Module):
             x_list, x = [x], None
             attention = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim,
                                                     lambda query, key, group: self._norm_rope_(query, key, rope, packed_rope, fused_rms),
-                                                    attention_fn=self.veda if use_veda else attention_experiment.callback(self.sol_attention is not None))
+                                                    attention_fn=self.veda if use_veda else kitchen_attention.callback(self.sol_attention is not None))
             return self._out_projection(attention, seq_len, residual, gate, segments)
         if split_qkv and hasattr(self, "vdn"):  # VDN projects q, k and v when it needs them: its linear branch reads them raw
             x_list, x, vdn_input = [x], None, None
@@ -344,8 +344,8 @@ class Attention(nn.Module):
             _rope_(qkv_list[:2], rope)
         if use_veda:
             attention = self.veda(qkv_list, attention_kit.HeadGroup(range(self.heads), range(self.heads), None))
-        elif attention_experiment.callback(self.sol_attention is not None) is not None and not use_sol:
-            attention = attention_experiment.attention(qkv_list)
+        elif kitchen_attention.callback(self.sol_attention is not None) is not None and not use_sol:
+            attention = kitchen_attention.attention(qkv_list)
         else:
             attention = pay_attention(qkv_list, recycle_q=True) if self.sol_attention is None else self.sol_attention(qkv_list, use_sol)
         return self._out_projection(attention, seq_len, residual, gate, segments)

@@ -635,6 +635,7 @@ class family_handler:
                 "veda": {"label": "Veda Learned Sparse Attention (Triton, NVIDIA SM80+)", "supports_sparsity": False},
             } if veda else {
                 "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
+                "kitchen_int8": {"label": "Kitchen INT8 (AMD HIP, experimental; H3 denoiser only)", "supports_sparsity": False},
             },
             "default_attention_modes_supported": not (vdn or veda),
             "attention": {">=0": "vdn"} if vdn else {">=80": "veda"} if veda else None,
