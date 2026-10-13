@@ -40,6 +40,22 @@ pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https
 pip install -r requirements.txt
 ```
 
+## H3 Kitchen INT8 Attention (experimental, AMD ROCm)
+
+For ordinary MiniMax H3 FL2VA/Ref2VA models, select **Advanced Mode > Misc >
+Override Attention Mode > kitchen_int8**. Availability is checked against the
+installed Comfy Kitchen HIP attention kernels. This is separate from the INT8
+linear math selector below; it can be used with different checkpoint weight
+formats. VDN and Veda models keep their model-specific attention.
+
+Only H3 denoiser blocks use Kitchen INT8 attention. Text/vision encoders, token
+refiners and video/audio VAEs use SDPA. INT8 arithmetic can change both video
+and audio output. The selection is stored in `override_attention`, including
+**Set Settings as Default**, exported settings, queue tasks and output metadata.
+Use `"override_attention": "kitchen_int8"` in Python API tasks; select `sdpa`
+or Default Attention Mode to switch back. CUDA Graphs remain unsupported for
+this experimental mode. No benchmark instrumentation runs in normal generation.
+
 ## INT8 Math Kernels
 
 In the configuration menu, **INT8 Math Kernels** selects the backend for INT8 quantized linear layers, including INT8 ConvRot checkpoints:

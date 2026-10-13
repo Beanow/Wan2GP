@@ -23,11 +23,21 @@ try:
 except:
     triton_installed = False
 
+try:
+    import comfy_kitchen as _kitchen
+    _kitchen_int8_installed = callable(getattr(_kitchen, "int8_attention", None)) and callable(getattr(_kitchen, "int8_attention_is_available", None))
+    _kitchen_int8_supported = bool(torch.version.hip and _kitchen_int8_installed and _kitchen.int8_attention_is_available())
+except (ImportError, OSError, RuntimeError):
+    _kitchen_int8_installed = _kitchen_int8_supported = False
 
 # Model-specific attention modes exposed only by per-generation overrides.
 # Keep these out of get_attention_modes() so they never appear in the main
 # application attention configuration.
 ATTENTION_MODE_AVAILABILITY = {
+    "kitchen_int8": {
+        "installed": _kitchen_int8_installed,
+        "supported": _kitchen_int8_supported,
+    },
     "sol": {
         "installed": triton_installed,
         "supported": triton_installed and (major, minor) in ((8, 6), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)),
@@ -359,6 +369,8 @@ def sage_staged(device, head_dim, force_attention=None, masked=False):
     pay_attention would run without sequence lengths on this device (with this force_attention, and a mask when masked):
     shared.sage2_core for SageAttention 2, shared.sage1_core for SageAttention without a mask; None otherwise."""
     attn = force_attention or offload.shared_state["_attention"]
+    if attn == "kitchen_int8":
+        attn = "sdpa"  # Kitchen is selected by H3's denoiser callback, not encoders/VAEs.
     if attn == "veda":
         attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
     attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
@@ -420,6 +432,8 @@ def pay_attention(
         raise ValueError("pay_attention received both attention_mask and causal=True; build a combined mask once and pass causal=False.")
     if attention_mask != None:
         requested_attn = offload.shared_state["_attention"] if force_attention == None else force_attention
+        if requested_attn == "kitchen_int8":
+            requested_attn = "sdpa"
         if requested_attn == "veda":
             requested_attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
         requested_attn = get_default_attention_mode() if requested_attn in ("sol", "vdn") else requested_attn
@@ -440,6 +454,8 @@ def pay_attention(
         if  attention_mask.dtype == torch.bfloat16 and not bfloat16_supported:
             attention_mask = attention_mask.to(torch.float16)
     attn = offload.shared_state["_attention"] if force_attention== None else force_attention
+    if attn == "kitchen_int8":
+        attn = "sdpa"
     if attn == "veda":
         attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
     attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
